@@ -34,7 +34,7 @@ bench = false
 
 [features]
 default = ["tracer"]
-tracer = ["dep:ddtrace-sidecar"]
+tracer = ["dep:ddtrace-sidecar", "dep:libdd-tracer-flare"]
 helper-rust-coverage = ["ddtrace-sidecar/helper-rust-coverage"]
 libddwaf-source-static = ["ddtrace-sidecar/libddwaf-source-static"]
 profiling = [
@@ -64,6 +64,7 @@ datadog-sidecar-ffi = { path = "libdatadog/datadog-sidecar-ffi" }
 libdd-data-pipeline = { path = "libdatadog/libdd-data-pipeline" }
 libdd-tinybytes = { path = "libdatadog/libdd-tinybytes" }
 libdd-trace-utils = { path = "libdatadog/libdd-trace-utils" }
+libdd-tracer-flare = { path = "libdatadog/libdd-tracer-flare", default-features = false, optional = true }
 libdd-trace-stats = { path = "libdatadog/libdd-trace-stats" }
 libdd-trace-protobuf = { path = "libdatadog/libdd-trace-protobuf" }
 libdd-crashtracker = { path = "libdatadog/libdd-crashtracker", default-features = false, features = ["collector"] }
@@ -123,6 +124,7 @@ bindgen = "0.72.1"
 cc = "1.0"
 
 [dev-dependencies]
+zip = { workspace = true, features = ["deflate"] }
 static_assertions = "1"
 
 [profile.dev]

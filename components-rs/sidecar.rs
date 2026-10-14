@@ -4,6 +4,7 @@ use datadog_sidecar::config::{self, AppSecConfig, LogMethod};
 use datadog_sidecar::service::agent_info::AgentInfoReader;
 use datadog_sidecar::service::blocking::{acquire_exception_hash_rate_limiter, SidecarTransport};
 use datadog_sidecar::service::exception_hash_rate_limiter::ExceptionHashRateLimiter;
+use datadog_sidecar::service::SidecarAction;
 use datadog_sidecar::tracer::shm_limiter_path;
 use datadog_sidecar_ffi::AgentRemoteConfigReader;
 use lazy_static::lazy_static;
@@ -12,6 +13,7 @@ use libdd_common::Endpoint;
 use libdd_common_ffi::slice::AsBytes;
 use libdd_common_ffi::{self as ffi, CharSlice, MaybeError};
 use libdd_ipc::rate_limiter::{ShmLimiter, ShmLimiterMemory};
+use libdd_telemetry::worker::{LifecycleAction, TelemetryActions};
 use libdd_telemetry_ffi::try_c;
 #[cfg(windows)]
 use spawn_worker::{get_trampoline_target_data, LibDependency};
@@ -283,6 +285,20 @@ pub extern "C" fn datadog_sidecar_reconnect(
     factory: unsafe extern "C" fn() -> Option<Box<SidecarTransport>>,
 ) -> bool {
     transport.reconnect(|| unsafe { factory() })
+}
+
+#[no_mangle]
+pub extern "C" fn ddog_sidecar_telemetry_lifecycle_stop(
+    transport: &mut Box<SidecarTransport>,
+) -> MaybeError {
+    try_c!(datadog_sidecar::service::blocking::enqueue_actions(
+        transport,
+        vec![SidecarAction::Telemetry(TelemetryActions::Lifecycle(
+            LifecycleAction::Stop,
+        ))],
+    ));
+
+    MaybeError::None
 }
 
 #[no_mangle]

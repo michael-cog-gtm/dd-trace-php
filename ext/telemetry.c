@@ -56,8 +56,7 @@ void datadog_telemetry_lifecycle_end() {
         return;
     }
 
-    datadog_ffi_try("Failed ending sidecar lifecycle",
-                    ddog_sidecar_lifecycle_end(&DATADOG_G(sidecar)));
+    datadog_ffi_try("Failed ending sidecar lifecycle", ddog_sidecar_telemetry_lifecycle_stop(&DATADOG_G(sidecar)));
 }
 
 void datadog_telemetry_finalize() {

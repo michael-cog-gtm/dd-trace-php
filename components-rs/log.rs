@@ -224,6 +224,9 @@ where
                     fmt_msg(event, &msg, "")
                 };
 
+                #[cfg(feature = "tracer")]
+                crate::tracer_flare::capture_log(&msg[..msg.len() - 1]);
+
                 COUNTERS.with(|counter| {
                     let mut counter = counter.borrow_mut();
                     *counter

@@ -745,6 +745,13 @@ typedef struct ddog_LiveDebuggerSetup {
   struct ddog_LiveDebuggerCallbacks callbacks;
 } ddog_LiveDebuggerSetup;
 
+typedef void (*ddog_TracerFlareConfigEntryCallback)(ddog_CharSlice name,
+                                                    ddog_CharSlice value,
+                                                    void *context);
+
+typedef void (*ddog_TracerFlareConfigCallback)(ddog_TracerFlareConfigEntryCallback add_entry,
+                                               void *context);
+
 /**
  * Holds the raw parts of a Rust Vec; it should only be created from Rust,
  * never from C.
