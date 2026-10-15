@@ -211,7 +211,8 @@ bool ddog_remote_config_alter_dynamic_config(struct ddog_RemoteConfigState *remo
  * before remote configuration can be processed.
  */
 void ddog_setup_remote_config(ddog_DynamicConfigUpdate update_config,
-                              const struct ddog_LiveDebuggerSetup *setup);
+                              const struct ddog_LiveDebuggerSetup *setup,
+                              ddog_TracerFlareConfigCallback tracer_flare_config);
 
 /**
  * Enable or disable dynamic instrumentation.
@@ -279,6 +280,8 @@ ddog_MaybeError ddog_sidecar_connect_php(struct ddog_SidecarTransport **connecti
 
 bool datadog_sidecar_reconnect(struct ddog_SidecarTransport **transport,
                                struct ddog_SidecarTransport *(*factory)(void));
+
+ddog_MaybeError ddog_sidecar_telemetry_lifecycle_stop(struct ddog_SidecarTransport **transport);
 
 void datadog_sidecar_set_reconnect_fn(struct ddog_SidecarTransport **transport,
                                       struct ddog_SidecarTransport *(*factory)(void));
@@ -474,6 +477,8 @@ bool ddog_sidecar_telemetry_are_endpoints_collected(struct ddog_ShmCacheMap *cac
 bool ddog_check_stats_trace_filter(ddog_CharSlice resource,
                                    const void *root_span,
                                    ddog_RootTagLookupFn lookup_fn);
+
+void ddog_tracer_flare_after_fork(void);
 
 /**
  * # Safety

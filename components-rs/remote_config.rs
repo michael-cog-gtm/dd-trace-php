@@ -29,10 +29,10 @@ use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_char;
+use std::ffi::{c_char, c_void};
 use std::mem;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::debug;
 
 #[allow(clippy::manual_dangling_ptr)] // cbindgen needs the literal sentinel address.
@@ -52,8 +52,14 @@ pub type DynamicConfigUpdate = for<'a> extern "C" fn(
     mode: DynamicConfigUpdateMode,
 ) -> *mut ZendString;
 
+pub type TracerFlareConfigEntryCallback =
+    for<'a> extern "C" fn(name: CharSlice<'a>, value: CharSlice<'a>, context: *mut c_void);
+pub type TracerFlareConfigCallback =
+    extern "C" fn(add_entry: TracerFlareConfigEntryCallback, context: *mut c_void);
+
 static mut LIVE_DEBUGGER_CALLBACKS: Option<LiveDebuggerCallbacks> = None;
 static mut DYNAMIC_CONFIG_UPDATE: Option<DynamicConfigUpdate> = None;
+static TRACER_FLARE_CONFIG_CALLBACK: OnceLock<TracerFlareConfigCallback> = OnceLock::new();
 
 type VecRemoteConfigProduct = libdd_common_ffi::Vec<RemoteConfigProduct>;
 #[no_mangle]
@@ -147,6 +153,8 @@ pub unsafe extern "C" fn ddog_init_remote_config(flags: RemoteConfigFlags) {
     mem::take(&mut DATADOG_REMOTE_CONFIG_CAPABILITIES);
 
     DATADOG_REMOTE_CONFIG_PRODUCTS.push(RemoteConfigProduct::ApmTracing);
+    DATADOG_REMOTE_CONFIG_PRODUCTS.push(RemoteConfigProduct::AgentConfig);
+    DATADOG_REMOTE_CONFIG_PRODUCTS.push(RemoteConfigProduct::AgentTask);
     DATADOG_REMOTE_CONFIG_CAPABILITIES.push(RemoteConfigCapabilities::ApmTracingCustomTags);
     DATADOG_REMOTE_CONFIG_CAPABILITIES.push(RemoteConfigCapabilities::ApmTracingEnabled);
     DATADOG_REMOTE_CONFIG_CAPABILITIES.push(RemoteConfigCapabilities::ApmTracingHttpHeaderTags);
@@ -209,6 +217,9 @@ pub unsafe extern "C" fn ddog_init_remote_config_state(
     endpoint: &Endpoint,
     di_enabled: bool,
 ) -> Box<RemoteConfigState> {
+    #[cfg(feature = "tracer")]
+    crate::tracer_flare::initialize(endpoint);
+
     #[allow(clippy::expect_used)]
     let registry = Arc::new(
         default_registry()
@@ -488,6 +499,22 @@ pub extern "C" fn ddog_process_remote_configs(remote_config: &mut RemoteConfigSt
                                 }
                             }
                         }
+                        RemoteConfigProduct::AgentConfig | RemoteConfigProduct::AgentTask => {
+                            #[cfg(feature = "tracer")]
+                            {
+                                if value.path.name() == "configuration_order" {
+                                    debug!("Ignoring tracer flare configuration_order file");
+                                } else if let Some(callback) =
+                                    TRACER_FLARE_CONFIG_CALLBACK.get().copied()
+                                {
+                                    crate::tracer_flare::process_add(
+                                        &data,
+                                        value.path.config_id(),
+                                        callback,
+                                    );
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -525,6 +552,10 @@ pub extern "C" fn ddog_process_remote_configs(remote_config: &mut RemoteConfigSt
                 RemoteConfigProduct::FfeFlags => {
                     debug!("FFE flags configuration removed");
                     crate::ffe::clear_config();
+                }
+                RemoteConfigProduct::AgentConfig => {
+                    #[cfg(feature = "tracer")]
+                    crate::tracer_flare::process_agent_config_remove(path.config_id());
                 }
                 _ => (),
             },
@@ -796,8 +827,10 @@ pub unsafe extern "C" fn ddog_remote_config_alter_dynamic_config(
 pub unsafe extern "C" fn ddog_setup_remote_config(
     update_config: DynamicConfigUpdate,
     setup: *const LiveDebuggerSetup,
+    tracer_flare_config: TracerFlareConfigCallback,
 ) {
     DYNAMIC_CONFIG_UPDATE = Some(update_config);
+    let _ = TRACER_FLARE_CONFIG_CALLBACK.set(tracer_flare_config);
     // SAFETY: the caller either provides a valid setup or null when the tracer is absent.
     if let Some(setup) = unsafe { setup.as_ref() } {
         ddog_register_expr_evaluator(setup.evaluator);

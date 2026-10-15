@@ -6,8 +6,11 @@
 #include <components/log/log.h>
 #include "threads.h"
 #include <components-rs/sidecar.h>
+#include <SAPI.h>
 #include <tracer/tracer_api.h>
 #include <tracer/live_debugger.h>
+#include <stdlib.h>
+#include <string.h>
 
 #if PHP_VERSION_ID < 70100
 #include <interceptor/php7/interceptor.h>
@@ -16,6 +19,26 @@
 #endif
 
 ZEND_EXTERN_MODULE_GLOBALS(datadog);
+
+static void dd_trace_flare_collect_config(ddog_TracerFlareConfigEntryCallback add_entry, void *context) {
+    zend_ini_entry *entry;
+    ZEND_HASH_FOREACH_PTR(EG(ini_directives), entry) {
+        if (entry && entry->name && ZSTR_LEN(entry->name) >= sizeof("datadog.") - 1 &&
+            memcmp(ZSTR_VAL(entry->name), "datadog.", sizeof("datadog.") - 1) == 0) {
+            add_entry(dd_zend_string_to_CharSlice(entry->name), entry->value ? dd_zend_string_to_CharSlice(entry->value) : DDOG_CHARSLICE_C(""),
+                      context);
+        }
+    }
+    ZEND_HASH_FOREACH_END();
+
+    const char *debug = getenv("DD_TRACE_DEBUG");
+    const char *log_level = getenv("DD_TRACE_LOG_LEVEL");
+    add_entry(DDOG_CHARSLICE_C("DD_TRACE_DEBUG"), debug ? (ddog_CharSlice){.ptr = debug, .len = strlen(debug)} : DDOG_CHARSLICE_C(""), context);
+    add_entry(DDOG_CHARSLICE_C("DD_TRACE_LOG_LEVEL"), log_level ? (ddog_CharSlice){.ptr = log_level, .len = strlen(log_level)} : DDOG_CHARSLICE_C(""),
+              context);
+    add_entry(DDOG_CHARSLICE_C("php_version"), DDOG_CHARSLICE_C(PHP_VERSION), context);
+    add_entry(DDOG_CHARSLICE_C("sapi"), (ddog_CharSlice){.ptr = sapi_module.name, .len = strlen(sapi_module.name)}, context);
+}
 
 #ifdef _WIN32
 static struct ddog_RemoteConfigNotification *remote_config_notification;
@@ -131,9 +154,9 @@ static zend_string *dd_dynamic_configuration_update(ddog_CharSlice config, zend_
 
 void datadog_minit_remote_config(void) {
 #ifdef DDTRACE
-    ddog_setup_remote_config(dd_dynamic_configuration_update, &ddtrace_live_debugger_setup);
+    ddog_setup_remote_config(dd_dynamic_configuration_update, &ddtrace_live_debugger_setup, dd_trace_flare_collect_config);
 #else
-    ddog_setup_remote_config(dd_dynamic_configuration_update, NULL);
+    ddog_setup_remote_config(dd_dynamic_configuration_update, NULL, dd_trace_flare_collect_config);
 #endif
     dd_prev_interrupt_function = zend_interrupt_function;
     zend_interrupt_function = dd_vm_interrupt;
