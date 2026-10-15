@@ -9,6 +9,7 @@ use libdd_common_ffi::CharSlice;
 use libdd_remote_config::RemoteConfigParsed;
 use libdd_tracer_flare::{FlareAction, LogLevel, TracerFlareManager};
 use serde_json::{json, Map, Value};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::c_void;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -64,6 +65,16 @@ static CAPTURE_FILE: OnceLock<ArcSwapOption<CaptureFile>> = OnceLock::new();
 static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CAPTURE_WRITERS: AtomicUsize = AtomicUsize::new(0);
 static FLARE_STATE_PID: AtomicU32 = AtomicU32::new(0);
+
+std::thread_local! {
+    /// The level this thread ran at before it raised itself for a flare.
+    ///
+    /// `FLARE_STATE` is process wide, but under ZTS every PHP thread installs its own
+    /// subscriber and processes the remote config itself, so only the thread that raised a
+    /// level can lower it again - including on the paths where another thread has already
+    /// taken the process-wide state down.
+    static THREAD_ORIGINAL: RefCell<Option<LogSettings>> = const { RefCell::new(None) };
+}
 
 fn state_slot() -> &'static ArcSwap<Mutex<FlareState>> {
     FLARE_STATE.get_or_init(|| ArcSwap::from_pointee(Mutex::new(FlareState::new(String::new()))))
@@ -176,9 +187,7 @@ fn process_set(config_id: &str, requested_level: LogLevel, values: BTreeMap<Stri
         .unwrap_or_else(|error| error.into_inner());
     let effective = begin_log_capture(&mut state.original_log_settings, &current, requested_level);
     if state.flare_dir.is_none() {
-        match create_flare_dir(std::process::id(), "collect")
-            .and_then(|directory| open_capture_file(&directory).map(|file| (directory, file)))
-        {
+        match create_flare_dir(std::process::id(), "collect").and_then(open_capture_file_in) {
             Ok((directory, file)) => {
                 capture_file_slot().store(Some(Arc::new(file)));
                 CAPTURE_ACTIVE.store(true, Ordering::Release);
@@ -202,25 +211,37 @@ fn process_set(config_id: &str, requested_level: LogLevel, values: BTreeMap<Stri
         .unwrap_or_else(|| "error".to_owned());
     let _ = state.manager.set_original_log_level(&original_level);
     let _ = state.manager.set_current_log_level(&effective.level);
+    capture_thread_log_level(&current);
     drop(state);
     set_runtime_log_level(&effective);
 }
 
 fn process_unset(config_id: Option<&str>) {
-    let (original, directory) = {
+    let directory = {
         let current_state = current_state();
         let mut state = current_state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(config_id) = config_id {
             if !state.active_config_ids.remove(config_id) {
+                // Another thread already took the flare down; this one still runs raised.
+                let torn_down = state.active_config_ids.is_empty();
+                drop(state);
+                if torn_down {
+                    restore_thread_log_level();
+                }
+                return;
+            }
+            if !state.active_config_ids.is_empty() {
+                // Another flare config still wants the capture, so keep it running.
                 return;
             }
         }
         state.active_config_ids.clear();
         state.effective_log_level = None;
+        state.original_log_settings = None;
         state.manager = TracerFlareManager::new(&state.agent_url, "php");
-        (state.original_log_settings.take(), state.flare_dir.take())
+        state.flare_dir.take()
     };
     stop_capture();
     if let Some(directory) = directory {
@@ -228,9 +249,7 @@ fn process_unset(config_id: Option<&str>) {
             debug!("Unable to remove cancelled tracer flare directory: {error}");
         }
     }
-    if let Some(original) = original {
-        set_runtime_log_level(&original);
-    }
+    restore_thread_log_level();
 }
 
 fn process_send(
@@ -247,10 +266,14 @@ fn process_send(
             Ok(true) => {}
             Ok(false) => {
                 debug!("Ignoring duplicate tracer flare task {}", task.uuid);
+                drop(state);
+                restore_thread_log_level();
                 return;
             }
             Err(error) => {
                 debug!("Unable to claim tracer flare task {}: {error}", task.uuid);
+                drop(state);
+                restore_thread_log_level();
                 return;
             }
         }
@@ -260,6 +283,8 @@ fn process_send(
                 Ok(directory) => directory,
                 Err(error) => {
                     debug!("Unable to create tracer flare directory: {error}");
+                    drop(state);
+                    restore_thread_log_level();
                     return;
                 }
             },
@@ -283,9 +308,7 @@ fn process_send(
         .as_ref()
         .map(|settings| effective_level(&settings.level).to_string())
         .unwrap_or_else(|| effective_level(&current.level).to_string());
-    if let Some(original) = original {
-        set_runtime_log_level(&original);
-    }
+    restore_thread_log_level();
 
     if let Err(error) = write_tracer_config(&directory, &values) {
         error!("Unable to write tracer flare configuration: {error}");
@@ -320,6 +343,30 @@ fn process_send(
     if let Err(error) = spawn_result {
         error!("Unable to start tracer flare upload thread: {error}");
         remove_flare_directory(&cleanup_directory);
+    }
+}
+
+/// Remember the level this thread runs at, before the flare raises it.
+///
+/// `ddog_set_log_level` is what `ext/logging.c` calls for INI and `ini_set` changes too, so
+/// its last value beats `DD_TRACE_LOG_LEVEL`, which only holds for a thread nobody overrode.
+fn capture_thread_log_level(current: &LogSettings) {
+    THREAD_ORIGINAL.with(|original| {
+        let mut original = original.borrow_mut();
+        if original.is_none() {
+            *original = Some(
+                crate::log::last_applied_log_level()
+                    .map(|(level, once)| LogSettings { level, once })
+                    .unwrap_or_else(|| current.clone()),
+            );
+        }
+    });
+}
+
+fn restore_thread_log_level() {
+    let original = THREAD_ORIGINAL.with(|original| original.borrow_mut().take());
+    if let Some(original) = original {
+        set_runtime_log_level(&original);
     }
 }
 
@@ -408,9 +455,19 @@ fn effective_level(level: &str) -> LogLevel {
     }
 }
 
+#[cfg(not(test))]
 fn set_runtime_log_level(settings: &LogSettings) {
     set_runtime_log_level_with(settings, |filter_level, once| unsafe {
         crate::log::ddog_set_log_level(CharSlice::from_bytes(filter_level.as_bytes()), once);
+    });
+}
+
+/// Record what would be applied instead of reconfiguring the process-wide subscriber, which
+/// other tests own.
+#[cfg(test)]
+fn set_runtime_log_level(settings: &LogSettings) {
+    set_runtime_log_level_with(settings, |filter_level, once| {
+        tests::record_applied_level(filter_level, once);
     });
 }
 
@@ -474,6 +531,18 @@ fn open_capture_file(directory: &Path) -> io::Result<CaptureFile> {
     })
 }
 
+/// Open the capture file of a freshly created flare directory, taking the directory with it
+/// if that fails - otherwise a failed open leaves the directory behind for good.
+fn open_capture_file_in(directory: PathBuf) -> io::Result<(PathBuf, CaptureFile)> {
+    match open_capture_file(&directory) {
+        Ok(file) => Ok((directory, file)),
+        Err(error) => {
+            remove_flare_directory(&directory);
+            Err(error)
+        }
+    }
+}
+
 fn stop_capture() {
     CAPTURE_ACTIVE.store(false, Ordering::Release);
     while CAPTURE_WRITERS.load(Ordering::Acquire) != 0 {
@@ -510,6 +579,7 @@ pub extern "C" fn ddog_tracer_flare_after_fork() {
     CAPTURE_ACTIVE.store(false, Ordering::Release);
     CAPTURE_WRITERS.store(0, Ordering::Release);
     capture_file_slot().store(None);
+    THREAD_ORIGINAL.with(|original| *original.borrow_mut() = None);
     let agent_url = agent_url_slot()
         .load_full()
         .map(|url| url.as_str().to_owned())
@@ -564,7 +634,10 @@ fn write_tracer_config(directory: &Path, values: &BTreeMap<String, String>) -> i
 
 fn redact_config_value(name: &str, value: &str) -> Value {
     let lower_name = name.to_ascii_lowercase();
-    if !(lower_name.contains("api_key") || lower_name.contains("app_key")) {
+    if !["key", "token", "secret", "password", "passwd"]
+        .iter()
+        .any(|marker| lower_name.contains(marker))
+    {
         return Value::String(value.to_owned());
     }
     let characters: Vec<char> = value.chars().collect();
@@ -588,8 +661,34 @@ mod tests {
     use libdd_remote_config::config::agent_task::{AgentTask, AgentTaskFile};
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::time::Duration;
     use zip::ZipArchive;
+
+    /// `FLARE_STATE` and the capture flag are process wide, so these tests run one at a time.
+    static FLARE_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+    std::thread_local! {
+        static APPLIED_LEVELS: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record_applied_level(level: &str, once: bool) {
+        APPLIED_LEVELS.with(|applied| applied.borrow_mut().push((level.to_owned(), once)));
+    }
+
+    fn applied_levels() -> Vec<(String, bool)> {
+        APPLIED_LEVELS.with(|applied| std::mem::take(&mut *applied.borrow_mut()))
+    }
+
+    fn reset_flare_state() {
+        THREAD_ORIGINAL.with(|original| *original.borrow_mut() = None);
+        applied_levels();
+        CAPTURE_ACTIVE.store(false, Ordering::Release);
+        capture_file_slot().store(None);
+        agent_url_slot().store(None);
+        state_slot().store(Arc::new(Mutex::new(FlareState::new(String::new()))));
+        FLARE_STATE_PID.store(std::process::id(), Ordering::Release);
+    }
 
     #[test]
     fn redact_sensitive_configuration_values() {
@@ -602,9 +701,162 @@ mod tests {
             Value::String("abcd".to_owned())
         );
         assert_eq!(
+            redact_config_value("datadog.test_session_token", "token-value"),
+            Value::String("*******alue".to_owned())
+        );
+        assert_eq!(
+            redact_config_value("datadog.some_password", "hunter2hunter2"),
+            Value::String("**********ter2".to_owned())
+        );
+        assert_eq!(
             redact_config_value("datadog.service", "checkout"),
             Value::String("checkout".to_owned())
         );
+    }
+
+    /// The thread runs at whatever `ext/logging.c` last applied to it, which INI and
+    /// `ini_set` can move away from `DD_TRACE_LOG_LEVEL` - restoring the config value would
+    /// leave the thread at `error` here.
+    #[test]
+    fn unset_restores_the_level_this_thread_last_applied() {
+        let _lock = FLARE_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_flare_state();
+        crate::log::record_applied_log_level("info", false);
+        let values = BTreeMap::from([("DD_TRACE_LOG_LEVEL".to_owned(), "error".to_owned())]);
+
+        process_set("flare-config", LogLevel::Debug, values);
+        process_unset(Some("flare-config"));
+
+        assert_eq!(
+            applied_levels(),
+            [("debug".to_owned(), true), ("info".to_owned(), false)]
+        );
+    }
+
+    /// Under ZTS both threads raise themselves for the same config, but only one of them
+    /// removes it from the process-wide state - the other has to lower itself on its own.
+    #[test]
+    fn every_thread_restores_its_own_level_after_a_flare() {
+        let _lock = FLARE_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_flare_state();
+
+        let (first_set, first_set_done) = mpsc::channel();
+        let (second_set, second_set_done) = mpsc::channel();
+        let (first_unset, first_unset_done) = mpsc::channel();
+
+        thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                crate::log::record_applied_log_level("info", false);
+                process_set("flare-config", LogLevel::Debug, BTreeMap::new());
+                first_set.send(()).expect("signal first set");
+                second_set_done.recv().expect("await second set");
+                process_unset(Some("flare-config"));
+                first_unset.send(()).expect("signal first unset");
+                applied_levels()
+            });
+            let second = scope.spawn(move || {
+                first_set_done.recv().expect("await first set");
+                crate::log::record_applied_log_level("warn", false);
+                process_set("flare-config", LogLevel::Debug, BTreeMap::new());
+                second_set.send(()).expect("signal second set");
+                first_unset_done.recv().expect("await first unset");
+                process_unset(Some("flare-config"));
+                applied_levels()
+            });
+
+            assert_eq!(
+                first.join().expect("first thread"),
+                [("debug".to_owned(), true), ("info".to_owned(), false)]
+            );
+            assert_eq!(
+                second.join().expect("second thread"),
+                [("debug".to_owned(), true), ("warn".to_owned(), false)]
+            );
+        });
+    }
+
+    /// Two agent configs can ask for a flare at once, and the first one going away must not
+    /// cancel the capture the other one still wants.
+    #[test]
+    fn overlapping_flare_configs_stop_only_with_the_last_one() {
+        let _lock = FLARE_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_flare_state();
+        crate::log::record_applied_log_level("info", false);
+
+        process_set("config-a", LogLevel::Debug, BTreeMap::new());
+        process_set("config-b", LogLevel::Debug, BTreeMap::new());
+        assert!(
+            CAPTURE_ACTIVE.load(Ordering::Acquire),
+            "capture not started"
+        );
+        applied_levels();
+
+        process_unset(Some("config-a"));
+        assert!(
+            CAPTURE_ACTIVE.load(Ordering::Acquire),
+            "capture stopped while config-b is still set"
+        );
+        assert!(
+            applied_levels().is_empty(),
+            "log level restored while config-b is still set"
+        );
+
+        process_unset(Some("config-b"));
+        assert!(
+            !CAPTURE_ACTIVE.load(Ordering::Acquire),
+            "capture kept after the last config went away"
+        );
+        assert_eq!(applied_levels(), [("info".to_owned(), false)]);
+    }
+
+    #[test]
+    fn duplicate_flare_send_restores_the_thread_level() {
+        let _lock = FLARE_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        reset_flare_state();
+        crate::log::record_applied_log_level("info", false);
+        process_set("flare-config", LogLevel::Debug, BTreeMap::new());
+        applied_levels();
+        let state = state_slot().load_full();
+        state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .handled_uuids
+            .insert("duplicate-uuid".to_owned());
+        let task = AgentTaskFile {
+            args: AgentTask {
+                case_id: "case".to_owned(),
+                hostname: "host".to_owned(),
+                user_handle: "user@example.com".to_owned(),
+            },
+            task_type: "tracer_flare".to_owned(),
+            uuid: "duplicate-uuid".to_owned(),
+        };
+
+        process_send(task, BTreeMap::new());
+
+        assert_eq!(applied_levels(), [("info".to_owned(), false)]);
+    }
+
+    /// A flare directory whose capture file cannot be opened is of no use to anyone, and
+    /// nothing else ever comes back to it.
+    #[test]
+    fn a_failed_capture_file_leaves_no_flare_directory() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let directory = base.path().join("flare");
+        create_private_dir(&directory).expect("create flare directory");
+        fs::create_dir(directory.join(format!("tracer_php_{}.log", std::process::id())))
+            .expect("block the capture file path");
+
+        assert!(open_capture_file_in(directory.clone()).is_err());
+        assert!(!directory.exists(), "failed flare directory left behind");
     }
 
     #[test]

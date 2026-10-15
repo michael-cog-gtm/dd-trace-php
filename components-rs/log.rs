@@ -92,6 +92,9 @@ std::thread_local! {
     static LOGGED_MSGS: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     static TRACING_GUARDS: RefCell<Option<tracing_core::dispatcher::DefaultGuard>> = const { RefCell::new(None) };
 
+    /// The log level last applied on this thread, which under ZTS is the one it really runs at.
+    static LAST_APPLIED: RefCell<Option<(String, bool)>> = const { RefCell::new(None) };
+
     // todo: MSRV 1.85+ make this const with HashMap::with_hasher
     static COUNTERS: RefCell<HashMap<Level, u32>> = RefCell::default();
 }
@@ -245,6 +248,7 @@ where
 
 #[no_mangle]
 pub unsafe extern "C" fn ddog_set_error_log_level(once: bool) {
+    record_applied_log_level("error", once);
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(LevelFilter::ERROR)
         .event_format(LogFormatter {
@@ -258,6 +262,7 @@ pub unsafe extern "C" fn ddog_set_error_log_level(once: bool) {
 #[no_mangle]
 pub unsafe extern "C" fn ddog_set_log_level(level: CharSlice, once: bool) {
     let level = level.to_utf8_lossy();
+    record_applied_log_level(level.as_ref(), once);
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::builder().parse_lossy(level.as_ref()))
         .event_format(LogFormatter {
@@ -266,6 +271,18 @@ pub unsafe extern "C" fn ddog_set_log_level(level: CharSlice, once: bool) {
         });
     set_log_subscriber(subscriber);
     set_global_log_filter(parse_targets_lossy(level.as_ref()), once);
+}
+
+/// Remember what this thread was last configured with.
+///
+/// `ext/logging.c` calls the setters on every RINIT and INI change, so this is the effective
+/// level of the thread, INI and `ini_set` overrides included - unlike `DD_TRACE_LOG_LEVEL`.
+pub(crate) fn record_applied_log_level(level: &str, once: bool) {
+    LAST_APPLIED.with(|last| *last.borrow_mut() = Some((level.to_owned(), once)));
+}
+
+pub(crate) fn last_applied_log_level() -> Option<(String, bool)> {
+    LAST_APPLIED.with(|last| last.borrow().clone())
 }
 
 /// Parse comma-separated filter directives, skipping the ones that do not parse.
@@ -375,6 +392,9 @@ mod tests {
 
     static CAPTURED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+    /// The subscriber and the global filter are process-wide, so their tests cannot overlap.
+    static GLOBAL_LOG_STATE: Mutex<()> = Mutex::new(());
+
     extern "C" fn capture(msg: CharSlice) {
         CAPTURED
             .lock()
@@ -400,6 +420,9 @@ mod tests {
     /// This test owns the process-wide subscriber, so it has to stay the only one installing it.
     #[test]
     fn the_global_filter_follows_later_level_changes() {
+        let _guard = GLOBAL_LOG_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         // SAFETY: the formatter only reads this pointer, and no other test writes it.
         unsafe { ddog_log_callback_off_thread = Some(capture) };
 
@@ -431,6 +454,31 @@ mod tests {
         );
         log(Log::Debug, "third");
         assert!(!logged(&drain(), "third"), "debug emitted at level error");
+    }
+
+    /// Leaving a flare has to put each thread back on its own level, so the setters - which
+    /// `ext/logging.c` calls on every RINIT and INI change - have to record what they applied.
+    #[test]
+    fn the_setters_record_the_level_applied_on_this_thread() {
+        let _guard = GLOBAL_LOG_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        unsafe { ddog_set_log_level(CharSlice::from_bytes(b"info"), false) };
+        assert_eq!(last_applied_log_level(), Some(("info".to_owned(), false)));
+        unsafe { ddog_set_error_log_level(true) };
+        assert_eq!(last_applied_log_level(), Some(("error".to_owned(), true)));
+
+        // Under ZTS every thread configures itself, so the record has to stay thread local.
+        let other = std::thread::spawn(|| {
+            assert_eq!(last_applied_log_level(), None);
+            unsafe { ddog_set_log_level(CharSlice::from_bytes(b"debug"), false) };
+            last_applied_log_level()
+        })
+        .join()
+        .expect("second thread");
+        assert_eq!(other, Some(("debug".to_owned(), false)));
+        assert_eq!(last_applied_log_level(), Some(("error".to_owned(), true)));
     }
 
     /// Per-target directives are what `dd_log_set_level` sends for startup logs.
